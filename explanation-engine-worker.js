@@ -4705,8 +4705,8 @@ function komodoTepCLICompleter(line) {
 let komodoTepInstance = null;
 let workerInitialized = false;
 
-// This is the main entry point for messages *from the main thread*
 onmessage = function(event) {
+    console.log(event)
     const message = event.data;
 
     // Check if it's our custom initialization message
