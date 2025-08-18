@@ -4705,8 +4705,8 @@ function komodoTepCLICompleter(line) {
 let komodoTepInstance = null;
 let workerInitialized = false;
 
+// This is the main entry point for messages *from the main thread*
 onmessage = function(event) {
-    console.log(event)
     const message = event.data;
 
     // Check if it's our custom initialization message
@@ -4717,12 +4717,16 @@ onmessage = function(event) {
         }
 
         try {
-            komodoTepInstance = KOMODO_TEP(message.wasmPath, {
-                onmessage: function(line) {
-                    // Forward all engine messages back to the main thread.
-                    postMessage(line);
-                }
-            });
+            // Directly call KOMODO_TEP with the wasmPath and options.
+            // KOMODO_TEP itself is the factory function for the worker.
+            komodoTepInstance = KOMODO_TEP(message.wasmPath);
+
+            // Set up the message handler for the engine's output
+            komodoTepInstance.onmessage = function(line) {
+                // The KomodoTep worker can send raw strings (UCI) or arrays (binary protocol).
+                // Forward these directly to the main thread.
+                postMessage(line);
+            };
 
             workerInitialized = true;
             postMessage({ type: 'initStatus', message: "[Worker]: Komodo TEP engine worker successfully started." });
@@ -4733,8 +4737,9 @@ onmessage = function(event) {
         }
     } else if (komodoTepInstance) {
         // If the worker is initialized, route other messages to the engine instance.
-        // SUGGESTION: Call this asynchronously for better stability.
-        komodoTepInstance.postMessage(message);
+        // The `true` argument here for postMessage means "synchronous" and is critical
+        // for how the KOMODO_TEP wrapper is designed (it has `if(sync) { return handler() } else { wait(handler.ccall,1) }`).
+        komodoTepInstance.postMessage(message, true); // Assuming all subsequent calls should be synchronous
     } else {
         postMessage({ type: 'error', message: "[Worker Error]: Engine not initialized. Send 'initKomodoWorker' message first." });
     }
