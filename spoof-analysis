@@ -1,0 +1,951 @@
+// ==UserScript==
+// @name         Local chess.com analysis
+// @namespace    Violentmonkey Scripts
+// @version      2.1
+// @description  Replaces chess.com's analysis with local analysis
+// @author       You
+// @match        https://www.chess.com/*
+// @grant        GM_getResourceText
+// @grant        GM_getResourceURL
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @require      https://raw.githubusercontent.com/93Pd9s8Jt/ChessAnalysis/refs/heads/main/chess.min.js
+// @run-at       document-start
+// ==/UserScript==
+
+
+
+
+(async function () {
+    // first of all we spoof relevant requests
+    // Save the original XMLHttpRequest constructor
+    const originalXMLHttpRequest = window.XMLHttpRequest;
+
+    // Create a new XMLHttpRequest constructor
+    function ModifiedXMLHttpRequest() {
+        console.log("ModifiedXMLHttpRequest")
+        const xhr = new originalXMLHttpRequest();
+
+        // Store the original onreadystatechange handler
+        const originalOnReadyStateChange = xhr.onreadystatechange;
+
+        // Override the onreadystatechange property to modify the response before it's used
+        xhr.onreadystatechange = function () {
+            console.log(xhr)
+            // If the request has finished (readyState 4), check if it's the right URL
+            if (xhr.readyState === 4 && xhr.status === 200 || xhr.status === 403) {
+                const url = xhr.responseURL;
+                // Check if this is the right API URL
+                if (url.match(/^https:\/\/www\.chess\.com\/callback\/analysis\/game\/live\/\d+\/all$/)) {
+                    try {
+                        // Parse the JSON response
+                        const jsonResponse = JSON.parse(xhr.responseText);
+
+                        // Check if the response has the structure we want to modify
+                        if (jsonResponse.data === null &&
+                            Array.isArray(jsonResponse.selfAnalysis) &&
+                            jsonResponse.selfAnalysis.length === 0 &&
+                            jsonResponse.pgn === null &&
+                            jsonResponse.analysisLogExists === false) {
+
+                            // Modify the 'analysisLogExists' field to true
+                            jsonResponse.analysisLogExists = true;
+
+                            // Convert the modified object back to a JSON string
+                            const modifiedResponseText = JSON.stringify(jsonResponse);
+
+                            // Use Object.defineProperty to make responseText writable
+                            Object.defineProperty(xhr, 'responseText', {
+                                value: modifiedResponseText,
+                                writable: true
+                            });
+                            xhr.responseText = modifiedResponseText;  // Modify the response property as well
+                            console.log("Spoofed analysisLogExists")
+                        }
+                    } catch (e) {
+                        console.error('Failed to modify response:', e);
+                    }
+                } else if (url.match(/^https:\/\/www\.chess\.com\/callback\/auth\/service\/analysis\?game_id=\d+&game_type=live$/)) {
+                    try {
+                        console.log(xhr);
+
+
+                        // Convert the modified object back to a JSON string
+                        const modifiedResponseText = JSON.stringify({ "token": placeholderToken });
+
+                        // Use Object.defineProperty to make responseText writable
+                        Object.defineProperty(xhr, 'responseText', {
+                            value: modifiedResponseText,
+                            writable: true
+                        });
+                        xhr.responseText = modifiedResponseText;  // Modify the response property as well
+                        Object.defineProperty(xhr, 'status', {
+                            value: 200,
+                            writable: true
+                        });
+                        xhr.status = 200;
+                        console.log("Spoofed chess.com auth token")
+
+                    } catch (e) {
+                        console.error('Failed to modify response:', e);
+                    }
+                }
+            }
+
+            // Call the original onreadystatechange handler (if any)
+            if (originalOnReadyStateChange) {
+                originalOnReadyStateChange.apply(xhr, arguments);
+            }
+        };
+
+        return xhr;
+    }
+
+    // Replace the XMLHttpRequest constructor with the modified one
+    window.XMLHttpRequest = ModifiedXMLHttpRequest;
+    let httpIntervalID = setInterval(() => {
+        window.XMLHttpRequest = ModifiedXMLHttpRequest;
+    }, 100)
+    setTimeout(() => {
+        clearInterval(httpIntervalID)
+    }, 50000)
+    console.log("Hooked XMLHttpRequest")
+
+
+
+    let komodoTepWorker = null;
+    let stockfishWorkers = [];
+    let engineReady = false; // Flag to indicate UCI handshake complete
+    await new Promise((resolve) => {
+        const intervalID = setInterval(
+            function () {
+                if (unsafeWindow.Config && unsafeWindow.Config.pathToEngineWorker) resolve()
+            },
+            100
+        )
+    })
+    console.log("Loaded script")
+
+
+    unsafeWindow.Config["pathToStockfishWorker"] = unsafeWindow.Config.pathToEngineWorker
+    unsafeWindow.Config["stockfishPoolSize"] = Math.max(2, (navigator.hardwareConcurrency || 4) - 1);
+    window.Config = unsafeWindow.Config
+
+    var globalCallbacks = {};
+
+    // --- Functions to create and manage the worker ---
+    function appendOutput(text) {
+        console.log(text);
+        return;
+
+    }
+
+    function createWorkerAndInitialize() {
+        if (komodoTepWorker) {
+            appendOutput("Worker already running. Terminating and re-creating.");
+            komodoTepWorker.terminate();
+            komodoTepWorker = null;
+        }
+        engineReady = false;
+
+        appendOutput("Creating Komodo TEP Web Worker...");
+        komodoTepWorker = new Worker(`${window.Config.pathToExplanationEngineWorker}#${window.Config.pathToWasmExplanationEngine}`);
+        for (let i = 0; i < window.Config.stockfishPoolSize; i++) {
+            stockfishWorkers.push(new Worker(window.Config.stockfish16_1.lite.singleThreaded.loader));
+            let w = stockfishWorkers[i];
+            w.onmessage = handleStockfishMessage;
+            w.onerror = (error) => {
+                appendOutput(`[Stockfish Worker Error Event]: ${error.message || error}`);
+                console.error("Stockfish worker error:", error);
+            };
+            w.postMessage('setoption name Threads value 1');
+            w.postMessage('setoption name MultiPV value 2');
+            w.postMessage('uci')
+        }
+
+        // init
+        komodoTepWorker.postMessage("uci");
+
+
+
+        komodoTepWorker.onmessage = handleKomodoTepMessage;
+        komodoTepWorker.onerror = (error) => {
+            appendOutput(`[Worker Error Event]: ${error.message || error}`);
+            console.error("Worker error:", error);
+        };
+        appendOutput("Worker created. Initializing engine...");
+    }
+
+    function handleStockfishMessage(event) {
+        const data = event.data;
+        const idx = stockfishWorkers.indexOf(event.target);
+        if (typeof data === 'string') {
+            // Dispatch callbacks
+            for (const key of Object.keys(globalCallbacks)) {
+                const m = key.match(/^(.+)-stockfish-(\d+)$/);
+                if (m) {
+                    const needle = m[1];         // e.g., "bestmove"
+                    const expectedIdx = +m[2];   // worker index in the key
+                    if (expectedIdx === idx && data.includes(needle)) {
+                        const cb = globalCallbacks[key];
+                        delete globalCallbacks[key];
+                        cb(data, idx);
+                    }
+                } else {
+                    if (data.includes(key)) {
+                        const cb = globalCallbacks[key];
+                        delete globalCallbacks[key];
+                        cb(data);
+                    }
+                }
+            }
+
+            // Optional: quiet the flood
+            if (/^info\b/.test(data)) return;
+            if (/^(id |option |uciok|bestmove\b)/.test(data)) {
+                //appendOutput(`[SF Output]: ${data}`);
+            }
+            return;
+
+            // if (data.includes('uciok')) {
+            //     engineReady = true;
+            //     appendOutput("Engine is UCI ready. You can now analyze.");
+            // }
+        } else if (data && typeof data === 'object') {
+            if (data.error) {
+                appendOutput(`[API Error]: ${data.error}`);
+            } else if (data.proto) { // This means the worker used js_post_proto
+                try {
+
+                    let jsonData;
+                    try {
+                        jsonData = JSON.parse(new TextDecoder().decode(data.proto));
+                    } catch (e) {
+
+                        const protoAsString = new TextDecoder().decode(data.proto);
+                        if (protoAsString.startsWith("{") && protoAsString.endsWith("}")) {
+                            jsonData = JSON.parse(protoAsString);
+                        } else {
+                            throw e; // Re-throw if it's not a JSON string either
+                        }
+                    }
+                    //appendOutput(`[API JSON Response from fetch analysis]:\n${JSON.stringify(jsonData, null, 2)}`);
+                    //displayAnalysisResults(jsonData);
+                } catch (parseError) {
+                    appendOutput(`[API Proto Response Parse Error]: ${parseError.message}\nRaw Bytes: ${Array.from(data.proto)}`);
+                }
+            } else if (data.call && data.retval !== undefined) { // From api_call_map
+                //appendOutput(`[API Return for ${data.call}]: ${data.retval}`);
+                // CEE_Init, CEE_NewFeature etc. don't seem to be used in the provided log for 'fetch analysis'
+            } else if (data.type === 'initStatus') {
+                //appendOutput(`[Worker Init Status]: ${data.message}`);
+                if (data.message.includes("successfully started")) {
+                    // Now that the worker confirms it's ready, send UCI
+                    komodoTepWorker.postMessage("uci");
+                }
+            } else if (data.call && data.json) { // For the 'fetch set-coach-asset'
+                //appendOutput(`[API JSON Response for ${data.call}]: ${data.json}`);
+            } else {
+                //appendOutput(`[Worker Message (Unhandled Structured)]: ${JSON.stringify(data)}`);
+            }
+        }
+    }
+
+    function handleKomodoTepMessage(event) {
+
+        const data = event.data;
+        if (typeof data === 'string') {
+            //appendOutput(`[Engine Output]: ${data}`);
+            for (const key in globalCallbacks) {
+                if (data.includes(key)) {
+                    globalCallbacks[key](data);
+                    delete globalCallbacks[key]; // Remove callback after use
+                }
+            }
+            if (data.includes('uciok')) {
+                engineReady = true;
+                appendOutput("Engine is UCI ready. You can now analyze.");
+            }
+        } else if (data && typeof data === 'object') {
+            if (data.error) {
+                appendOutput(`[API Error]: ${data.error}`);
+            } else if (data.proto) { // This means the worker used js_post_proto
+                try {
+                    // The log showed Chess.com's worker sending JSON stringified for 'fetch analysis'
+                    // If it sends raw bytes, we need to decode. For now, let's assume it might be JSON string.
+                    let jsonData;
+                    try {
+                        jsonData = JSON.parse(new TextDecoder().decode(data.proto));
+                    } catch (e) {
+                        // If parsing raw bytes as JSON fails, it might be a JSON string directly.
+                        // This handles both cases where the worker might send raw bytes or a pre-stringified JSON.
+                        const protoAsString = new TextDecoder().decode(data.proto);
+                        if (protoAsString.startsWith("{") && protoAsString.endsWith("}")) {
+                            jsonData = JSON.parse(protoAsString);
+                        } else {
+                            throw e; // Re-throw if it's not a JSON string either
+                        }
+                    }
+                    appendOutput(`[API JSON Response from fetch analysis]:\n${JSON.stringify(jsonData, null, 2)}`);
+                    displayAnalysisResults(jsonData);
+                } catch (parseError) {
+                    appendOutput(`[API Proto Response Parse Error]: ${parseError.message}\nRaw Bytes: ${Array.from(data.proto)}`);
+                }
+            } else if (data.call && data.retval !== undefined) { // From api_call_map
+                appendOutput(`[API Return for ${data.call}]: ${data.retval}`);
+                // CEE_Init, CEE_NewFeature etc. don't seem to be used in the provided log for 'fetch analysis'
+            } else if (data.type === 'initStatus') {
+                appendOutput(`[Worker Init Status]: ${data.message}`);
+                if (data.message.includes("successfully started")) {
+                    // Now that the worker confirms it's ready, send UCI
+                    komodoTepWorker.postMessage("uci");
+                }
+            } else if (data.call && data.json) { // For the 'fetch set-coach-asset'
+                appendOutput(`[API JSON Response for ${data.call}]: ${data.json}`);
+            } else {
+                appendOutput(`[Worker Message (Unhandled Structured)]: ${JSON.stringify(data)}`);
+            }
+        }
+    }
+
+    function extractClocksFromPgn(pgn) {
+        // Captures strings like 0:29:56.7 or 0:04:06
+        const rx = /%clk\s+([0-9]+:[0-9]{2}:[0-9]{2}(?:\.[0-9])?)/g;
+        const clocks = [];
+        let m;
+        while ((m = rx.exec(pgn)) !== null) clocks.push(m[1]);
+        return clocks; // one per move in order
+    }
+
+    function parseInfoMultipv(line) {
+        if (!line.startsWith('info')) return null;
+
+        // tokenise by spaces, but keep pv as a tail substring
+        // We find indices of key tokens in any order.
+        const mPV = line.match(/\bmultipv\s+(\d+)/);
+        const mDepth = line.match(/\bdepth\s+(\d+)/);
+        const mScore = line.match(/\bscore\s+(cp|mate)\s+(-?\d+)(?:\s+(lowerbound|upperbound))?/);
+        const mPv = line.match(/\bpv\s+(.+)$/);
+
+        if (!mPV || !mDepth || !mScore || !mPv) return null;
+
+        return {
+            k: +mPV[1],
+            depth: +mDepth[1],
+            scoreType: mScore[1],        // 'cp' or 'mate'
+            score: +mScore[2],
+            bound: mScore[3] || null,    // 'lowerbound'|'upperbound'|null
+            pv: mPv[1].trim()            // UCI moves: "e2e4 e7e5 ..."
+        };
+    }
+
+    function flipStmClearEp(fen) {
+        // FEN: <board> <stm> <castling> <ep> <half> <full>
+        const parts = fen.trim().split(/\s+/);
+        if (parts.length < 6) return fen;
+        parts[1] = (parts[1] === 'w') ? 'b' : 'w';
+        parts[3] = '-'; // clear en passant square for a true null-move emulation
+        return parts.join(' ');
+    }
+
+    function sideToMoveFromFen(fen) {
+        return fen.trim().split(/\s+/)[1]; // 'w' | 'b'
+    }
+
+    function orientFromFen(fen, rec) {
+        const stm = sideToMoveFromFen(fen);
+        const o = orientScoreWhite(stm, rec.scoreType, rec.score); // you already have orientScoreWhite
+        return { cp: o.cp, mate: o.mate, depth: rec.depth, pv: rec.pv };
+    }
+
+    function stmAfter(baseFen, movesArray) {
+        const c = new window.Chess(baseFen);
+        for (const uci of movesArray || []) {
+            // parse UCI: e2e4, a7a8q...
+            const from = uci.slice(0, 2);
+            const to = uci.slice(2, 4);
+            const promotion = uci.length > 4 ? uci.slice(4) : undefined;
+            c.move({ from, to, promotion });
+        }
+        return c.turn(); // 'w' or 'b'
+    }
+    function flipStm(stm) {
+        return (stm === 'w') ? 'b' : 'w';
+    }
+
+
+    function orientScoreWhite(stm, scoreType, rawVal) {
+        if (scoreType === 'cp') {
+            return { cp: (stm === 'w') ? rawVal : -rawVal, mate: null };
+        } else { // 'mate'
+            // In UCI: positive mate means side-to-move mates in N.
+            // Convert to White-centric signed mate ply:
+            const mate = (stm === 'w') ? rawVal : -rawVal;
+            return { cp: null, mate };
+        }
+    }
+
+    function fenAfter(baseFen, movesArray) {
+        const c = new window.Chess(baseFen);
+        for (const uci of movesArray) {
+            const from = uci.slice(0, 2);
+            const to = uci.slice(2, 4);
+            const promotion = uci.length > 4 ? uci.slice(4) : undefined;
+            c.move({ from, to, promotion });
+        }
+        return c.fen();
+    }
+
+    async function sfAnalyzeVariations(fen, multipv, movetimeMs) {
+        const pool = ensureSfPool();
+        const res = await pool.analyze(fen, multipv, movetimeMs);
+        return res.finals.map(r => orientFromFen(fen, r));
+    }
+
+    async function sfAnalyzeThreat(fen, movetimeMs) {
+        const threatFen = flipStmClearEp(fen);
+        const pool = ensureSfPool();
+        const res = await pool.analyze(threatFen, 1, movetimeMs);
+        return res.finals.map(r => orientFromFen(threatFen, r));
+    }
+
+
+
+    function listenDuring(fn, worker) {
+        const handler = (e) => {
+            const line = e?.data ?? e;
+            if (typeof line === 'string') fn(line);
+        };
+        worker.addEventListener?.('message', handler);
+        return () => worker.removeEventListener?.('message', handler);
+    }
+
+    function convertPGN(pgn) {
+        const chess = new window.Chess();
+        chess.loadPgn(pgn);
+
+        const history = chess.history({ verbose: true });
+        const moves = history.map(move => move.from + move.to + (move.promotion || ''));
+
+        return moves;
+    }
+
+    // --- Core Logic: Analyze a position and get explanation ---
+    async function analyzeAndExplain(movesToExplain, message, callback) {
+        const pgn = message.game.pgn;
+        if (!komodoTepWorker || !engineReady) {
+            appendOutput("Engine not ready. Please wait or check errors.");
+            return;
+        }
+
+        const baseFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        const N = 2; // MultiPV count
+        let postMessages = []
+        const post = (msg) => {
+            komodoTepWorker.postMessage(msg)
+            appendOutput(`[Post] ${msg}`);
+            postMessages.push(msg)
+        };
+        const clocks = extractClocksFromPgn(pgn);
+
+        function emitVariations(finals) {
+            for (const v of finals) {
+                if (v.mate !== null) {
+                    post(`variation ${v.pv} mate ${v.mate} depth ${v.depth}`);
+                } else {
+                    post(`variation ${v.pv} cp ${v.cp} depth ${v.depth}`);
+                }
+            }
+        }
+        function emitThreatVariations(finals) {
+            for (const v of finals) {
+                if (v.mate !== null) {
+                    post(`threat-variation ${v.pv} mate ${v.mate} depth ${v.depth}`);
+                } else {
+                    post(`threat-variation ${v.pv} cp ${v.cp} depth ${v.depth}`);
+                }
+            }
+        }
+        async function searchAndCollectPVs(movesArray, depth, worker, isThreat) {
+
+            // Aggregate PVs by multipv index
+            const pvMap = new Map(); // k -> {depth, scoreType, score, pv}
+            const fenNow = fenAfter(baseFen, movesArray);
+            const fenSearch = isThreat ? flipStmClearEp(fenNow) : fenNow;
+
+            let stm = stmAfter(baseFen, movesArray);
+            if (isThreat) stm = flipStm(stm);
+
+            const stopListen = listenDuring((line) => {
+                if (!line.match(/info .*multipv /)) return;
+                const rec = parseInfoMultipv(line);
+                if (!rec) return;
+                const prev = pvMap.get(rec.k);
+                if (!prev || rec.depth > prev.depth) pvMap.set(rec.k, rec);
+            }, worker);
+
+            // Drive UCI engine
+            worker.postMessage(`position fen ${fenSearch}`);
+            worker.postMessage(`go depth ${depth}`);
+
+            // Wait for bestmove to mark the end of this search
+            const bestLine = await awaitStockfishOutput(`bestmove-stockfish-${stockfishWorkers.indexOf(worker)}`, stockfishWorkers.indexOf(worker)); // e.g., "bestmove e1d1 ponder a8b8"
+            stopListen();
+
+            // Finalize PVs 1..N
+            const finals = [];
+            for (let k = 1; k <= N; k++) {
+                const r = pvMap.get(k);
+                if (!r) continue;
+                const oriented = orientScoreWhite(stm, r.scoreType, r.score);
+
+                finals.push({
+                    pv: r.pv,                  // "e2e4 e7e5 ..."
+                    cp: oriented.cp,           // number | null
+                    mate: oriented.mate,       // number | null
+                    depth: r.depth
+                });
+            }
+
+            const bestmove = (bestLine.split(/\s+/)[1] || '').trim(); // UCI move like 'e1d1'
+            return { finals, bestmove };
+        }
+
+
+        appendOutput("--- Starting Analysis Sequence ---");
+
+        // 1. Send UCI options (as seen in the log)
+        appendOutput("Configuring engine options...");
+
+        post("setoption name SerializeLikeCEAC value true");
+        post("setoption name ClassificationV3 value true");
+        post("setoption name BasicVariationThemes value false");
+        post(`setoption name Language value ${message.options.tep.lang}`);
+        post("setoption name SpeechV2 value false");
+        post("setoption name SpeechV3 value true");
+        post(`setoption name UserColor value ${message.options.tep.userColor}`);
+        post("setoption name WhiteElo value 987");
+        post("setoption name BlackElo value 962");
+        post("setoption name Termination value Zecik1942 won by checkmate");
+        post("setoption name Result value 1-0");
+        post("setoption name TimeControl value 1800");
+        post("setoption name EvalSourceEngine value Stockfish15.1");
+        post("setoption name Strength value Fast");
+        post("setoption name GamePhaseV2 value true");
+        post("setoption name BadKeyMomentsNeedMaterialOrMate value false");
+        post("setoption name NullMoveRepresentation value --");
+        post("setoption name SerializeLikeCEACV3 value true");
+        post("setoption name PersonalSpeechForOpponentMoves value true");
+        post("setoption name PlayVsCoachUseAssetTiersAndPlyLimit value true");
+        post("setoption name GameReviewOpeningSpeechVariety value true");
+        post("setoption name HandleContinuations value false");
+        post("setoption name HandleNullMoveContinuations value false");
+        post("setoption name GetThemes value true");
+        post("setoption name ScoreWhiteToMove value true");
+        post("setoption name InsightsTags value false");
+        post("setoption name Coach value ");
+        post("setoption name CoachAssetsV2 value true");
+        post("setoption name UCI_Variant value chess");
+        post("setoption name UCI_Chess960 value false");
+
+
+
+        // 2. Set the position *including* the move to be explained
+        //appendOutput(`Setting position: fen ${baseFen} moves ${movesToExplain}`);
+
+        post("ucinewgame");
+
+
+        // IMPORTANT: initialize CEE’s internal review builder at the game start
+        // Don't confuse this with the UCI 'position' used for search. We send it once to CEE.
+
+        // before any moves, analyse the position
+        post(`position fen ${baseFen}`);
+        var analysisOutput = {};
+        var taskPool = [];
+        var availableStockfishWorkers = [...stockfishWorkers];
+        var workerPromises = [];
+        let jobsDone = 0
+
+        availableStockfishWorkers.push = function (...args) {
+            for (const w of args) {
+                if (workerPromises.length) {
+                    const resolve = workerPromises.shift();
+                    resolve(w);
+                } else {
+                    Array.prototype.push.call(this, w);
+                }
+            }
+        };
+        async function getStockfishWorker() {
+            if (availableStockfishWorkers.length) {
+                return availableStockfishWorkers.shift();
+            }
+            return new Promise(resolve => workerPromises.push(resolve));
+        }
+        async function manageJob(task) {
+            return new Promise(async (resolve, reject) => {
+                const worker = await getStockfishWorker();
+                const result = await searchAndCollectPVs(movesToExplain.slice(0, task.move + 1), message.options.depth, worker, task.isThreat);
+                if (!(task.move in analysisOutput)) analysisOutput[task.move] = {}
+                analysisOutput[task.move][task.isThreat ? "threat" : "normal"] = result.finals;
+                availableStockfishWorkers.push(worker);
+                jobsDone++;
+                console.log(`Jobs done: ${jobsDone}/${taskPool.length}`);
+                callback(jobsDone, taskPool.length, "stockfish")
+                resolve(result);
+            })
+        }
+
+        taskPool.push({
+            move: -1,
+            isThreat: false
+        })
+        taskPool.push({
+            move: -1,
+            isThreat: true
+        })
+        for (let i = 0; i < movesToExplain.length; i++) {
+            taskPool.push({
+                move: i,
+                isThreat: false
+            })
+            taskPool.push({
+                move: i,
+                isThreat: true
+            })
+        }
+        await Promise.all(taskPool.map(manageJob));
+
+
+        // Start node first
+        if (analysisOutput[-1]) {
+            const info = analysisOutput[-1];
+            // Normal PVs
+            const normal = info.normal || [];
+            emitVariations(normal);
+            if (!normal.length) {
+                // If no PVs were produced (e.g., terminal), send a sentinel
+                const fenNow = fenAfter(baseFen, movesToExplain.slice(0, moveNumber + 1));
+                const c = new window.Chess(fenNow);
+                // Checkmate vs stalemate/draw
+                //console.log(c)
+                post(c.isCheckmate() ? 'variation mate 0 depth 0' : 'variation cp 0 depth 0');
+            }
+
+            // Threat PVs
+            const threat = info.threat || [];
+            emitThreatVariations(threat);
+            if (!threat.length) {
+                // Chess.com sends this when no threat PV is available
+                post('threat-variation cp 0 depth 0');
+            }
+        }
+
+        // Then each ply in order
+        for (let moveNumber = 0; moveNumber < movesToExplain.length; moveNumber++) {
+            post(`push ${movesToExplain[moveNumber]}`);
+            if (clocks[moveNumber]) post(`clock ${clocks[moveNumber]}`);
+
+            const info = analysisOutput[moveNumber] || {};
+
+            // Normal PVs
+            const normal = info.normal || [];
+            emitVariations(normal);
+            if (!normal.length) {
+                // If no PVs were produced (e.g., terminal), send a sentinel
+                const fenNow = fenAfter(baseFen, movesToExplain.slice(0, moveNumber + 1));
+                const c = new window.Chess(fenNow);
+                // Checkmate vs stalemate/draw
+                //console.log(c);
+                post(c.isCheckmate() ? 'variation mate 0 depth 0' : 'variation cp 0 depth 0');
+            }
+
+            // Threat PVs
+            const threat = info.threat || [];
+            emitThreatVariations(threat);
+            if (!threat.length) {
+                // Chess.com sends this when no threat PV is available
+                post('threat-variation cp 0 depth 0');
+            }
+            callback(moveNumber + 1, movesToExplain.length, "explanation")
+        }
+
+        // console.log("Normal analysis")
+        // const initPostMove = await searchAndCollectPVs([], 1500, stockfishWorkers[0], false);
+        // emitVariations(initPostMove.finals);
+
+        // console.log("Threat analysis")
+        // const initNullMove = await searchAndCollectPVs([], 1500, stockfishWorkers[1], true);
+        // emitThreatVariations(initNullMove.finals)
+
+        // let i = 0;
+        // for (const move of movesToExplain) {
+        //     post(`push ${move}`);
+        //     if (clocks[i]) post(`clock ${clocks[i]}`);
+
+        //
+        //     // Here, we delegate the tasks to stockfish - create a pool with variation and threat variation
+
+
+        //     console.log("Normal analysis")
+        //     const postMove = await searchAndCollectPVs(movesToExplain.slice(0, i), 1500, stockfishWorkers[0], false);
+        //     emitVariations(postMove.finals);
+
+        //     console.log("Threat analysis")
+        //     const nullMove = await searchAndCollectPVs(movesToExplain.slice(0, i), 1500, stockfishWorkers[1], true);
+        //     emitThreatVariations(nullMove.finals)
+
+
+        // }
+
+        console.log(postMessages);
+
+        // D) Now fetch analysis
+        appendOutput("Requesting 'fetch analysis' from Komodo TEP...");
+        post('fetch analysis');
+        appendOutput('Analysis request sent. Waiting for JSON response with explanations...');
+        const analysis = JSON.parse((await awaitOutput('json')).replace(/^json\s+/, ''));
+        return analysis
+
+    }
+
+    function awaitOutput(expectedOutput) {
+        return new Promise((resolve) => {
+            globalCallbacks[expectedOutput] = (data) => {
+                if (data.includes(expectedOutput)) {
+                    //appendOutput(`[Awaited Output Received]: ${data}`);
+                    resolve(data);
+                }
+            }
+        });
+    }
+    function awaitStockfishOutput(expectedOutput, workerIndex) {
+        return new Promise((resolve) => {
+            globalCallbacks[expectedOutput] = (data, sWorkerIndex) => {
+                if (data.includes(expectedOutput.replace(/-stockfish-\d+/, "")) && sWorkerIndex === workerIndex) {
+                    //appendOutput(`[Awaited Output Received]: ${data}`);
+                    resolve(data);
+                }
+            }
+        });
+    }
+
+    function displayAnalysisResults(analysisData) {
+        const resultsDiv = document.getElementById('analysisResults');
+        resultsDiv.innerHTML = ''; // Clear previous results
+
+        if (!analysisData || !analysisData.positions) {
+            resultsDiv.innerHTML = "<p>No analysis data received or data is malformed.</p>";
+            return;
+        }
+
+        let html = `<h3>Game Analysis & Explanations</h3>`;
+        html += `<p><strong>Starting FEN:</strong> ${analysisData.startingFen}</p>`;
+        if (analysisData.whiteElo && analysisData.blackElo) {
+            html += `<p><strong>White Elo:</strong> ${analysisData.whiteElo}, <strong>Black Elo:</strong> ${analysisData.blackElo}</p>`;
+        }
+
+        // Iterate through the positions in the analysis
+        // The last position in the array will correspond to the state *after* the last move.
+        analysisData.positions.forEach((posData, index) => {
+            html += `<div class="move-explanation">`;
+            html += `<h4>Position after ${index === 0 ? 'start' : `ply ${posData.firstMoveNumber + index - 1}`}: ${posData.fen}</h4>`;
+
+            if (posData.playedMove) {
+                html += `<p><strong>Played Move (${posData.playedMove.moveLan || 'N/A'}):</strong> `;
+                if (posData.playedMove.speech && posData.playedMove.speech.length > 0) {
+                    html += posData.playedMove.speech.map(s => s.sentence.join('')).join(' ');
+                } else {
+                    html += "No specific explanation.";
+                }
+                html += ` (Eval: ${posData.playedMove.score !== undefined ? (posData.playedMove.score).toFixed(2) : 'N/A'}, Classification: ${posData.playedMove.classification || posData.classificationName || 'N/A'})</p>`;
+            }
+
+            if (posData.bestMove) {
+                html += `<p><strong>Suggested Best Move (${posData.bestMove.moveLan || 'N/A'}):</strong> `;
+                if (posData.bestMove.speech && posData.bestMove.speech.length > 0) {
+                    html += posData.bestMove.speech.map(s => s.sentence.join('')).join(' ');
+                } else {
+                    html += "No specific explanation.";
+                }
+                html += ` (Eval: ${posData.bestMove.score !== undefined ? (posData.bestMove.score).toFixed(2) : 'N/A'}, Classification: ${posData.bestMove.classification || 'N/A'})</p>`;
+            }
+            html += `</div>`;
+        });
+
+        if (analysisData.reportCard && analysisData.reportCard.speech) {
+            html += `<h4>Game Summary (Report Card)</h4><p>${analysisData.reportCard.speech}</p>`;
+        }
+
+        resultsDiv.innerHTML = html;
+    }
+
+
+
+    async function callScript(message, callback) {
+        // const fen = fenInput.value.trim() || "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        const moves = convertPGN(message.game.pgn);
+
+
+        // The 'moves' for the `position` command should include all moves up to and *including*
+        // the one you want to get an explanation for.
+        const analysis = await analyzeAndExplain(moves, message, callback)
+        console.log(analysis);
+        return analysis;
+    };
+
+
+    function quitScript() {
+        if (komodoTepWorker) {
+            appendOutput("Sending 'quit' to Komodo TEP worker...");
+            komodoTepWorker.postMessage("quit");
+            komodoTepWorker.terminate();
+            komodoTepWorker = null;
+        }
+        engineReady = false;
+        appendOutput("Engine worker terminated.");
+    };
+
+    // Initial setup on page load
+    createWorkerAndInitialize();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    'use strict';
+    const placeholderToken = "gAAAAABonLsfQYd3v8-TKC74kus_xpw5f6xkRnrNXpCkj6ikRQGUcHufmUx1TrwZb2PbN48tSoj2d4gVMOQ7jqTDdoAjZTwSBZVSb2cu85-432CJmQoY_NzsLAe90RwHx3xYRQBclMICnss8hs5lYElwumwwSf6doFfN8WgsHdjkspKI72Y5n90aRARKKHwDPD-MXAzVjXXl5BsupN1C6pJmRc1_F7mwTI3gTokA1UyxYMFpWRcEKJyxCe_YVORNp5YRWuEaK7uJYKdXm11Jvu8BssVszYBiPNI6Z9Z_AsTUfgr7WR952vLjY8IJrqDMHibF_UyDm6hOxljnRJCLb9vl69hzqYO0GrApsttAyGs1giLlLLroe6GpVJYw4vHo5zLqMy33dYOybUI0MSBEANhqCC8aXnmeLaj-P_5hAU8BeHGkAvjeJqE_a8dEzMZDj7ZUCHfMZ8fZJcSDuFwyKl-4tMfweEte5PsHK0yiUz3zAKO9oaVuwiZDo6RUBppuDW2V5GtTdg5B"
+    const metadata = {
+        "clientRequest": {
+            "caps2": true,
+            "depth": 18,
+            "engineType": "stockfish16 nnue",
+            "source": {
+                "gameId": parseInt(window.location.href.match(/https:\/\/www\.chess\.com\/analysis\/game\/live\/(\d+)/)[1]),
+                "gameType": "live",
+                "url": "",
+                "token": placeholderToken,
+                "client": "web",
+                "userTimeZone": "Europe/London"
+            },
+            "strength": "Fast",
+            "tep": {
+                "ceeDebug": false,
+                "classificationv3": true,
+                "nullMoveRepresentation": "--",
+                "basicVariationThemes": true,
+                "speechv3": true,
+                "userColor": "white",
+                "lang": "en_US",
+                "coachLocale": "en-US",
+                "coachTextId": "Generic_coach"
+            },
+            "newCoachAssetsCeac": true,
+            "playVsCoachUseAssetTiersAndPlyLimit": true,
+            "userId": 358997525
+        }
+    }
+
+
+
+
+    if (window.WebSocket.prototype._originalSend === undefined) {
+        window.WebSocket.prototype._originalSend = window.WebSocket.prototype.send;
+        window.WebSocket.prototype.send = async function (data) {
+            const wsInstance = this;
+            // console.log('INTERCEPTED WebSocket.prototype.send for URL:', wsInstance.url);
+            // console.log('Data being sent:', data); // Can be very verbose
+
+            if (wsInstance.url && wsInstance.url.startsWith("wss://analysis.chess.com")) {
+                console.log("This is an analysis WebSocket send call!");
+                try {
+                    const message = JSON.parse(data);
+                    if (message.action === "gameAnalysis" && message.game && message.game.pgn) {
+                        console.log("Caught gameAnalysis action via prototype.send.");
+                        console.log(message.game.pgn)
+                        console.log("Waiting for engine to ready")
+                        await new Promise((resolve) => {
+                            const intervalID = setInterval(
+                                function () {
+                                    if (engineReady) resolve()
+                                },
+                                100
+                            )
+                        })
+                        console.log("Engine ready.")
+                        let actualAnalysis = await callScript(message, function (jobsDone, totaljobs, type) {
+                            (type === "stockfish")
+                            const progressMessage = {
+                                action: "progress",
+                                progress: (type === "stockfish") ? jobsDone / totaljobs * 0.9 : 0.9 + jobsDone / totaljobs * 0.09,
+                                engineType: "stockfish16.1",
+                                strength: "Slow"
+                            }
+                            console.log("Sending SPOOFED progress via prototype.send:", progressMessage.progress);
+                            // Call the original onmessage with the spoofed data
+                            // Ensure 'this' context is correct for the handler
+                            if (wsInstance.onmessage) {
+                                wsInstance.onmessage.call(wsInstance, { data: JSON.stringify(progressMessage) });
+                            }
+
+                        });
+                        console.log(actualAnalysis);
+                        console.log(wsInstance);
+                        //actualAnalysis.data = {"metaData": metadata};
+
+
+                        const finalAnalysis = { "action": "analyzeGame", "data": actualAnalysis };
+                        if (wsInstance.onmessage) wsInstance.onmessage.call(wsInstance, { data: JSON.stringify(finalAnalysis) });
+                        console.log("sent data");
+
+                        setTimeout(() => {
+                            const doneMessage = { action: "done" };
+                            console.log("Sending SPOOFED done message via prototype.send.");
+
+                            wsInstance.onmessage.call(wsInstance, { data: JSON.stringify(doneMessage) });
+                        }, 100);
+
+
+
+                        // IMPORTANT: Do NOT call the original send for this specific message
+                        // as we are handling it entirely by spoofing.
+                        console.log("Preventing original send for gameAnalysis message.");
+                        return;
+                    } else {
+                        console.log("Analysis WebSocket: Unhandled action or message structure:", message.action);
+                    }
+                } catch (e) {
+                    console.error("Error in prototype.send interceptor for analysis WS:", e, data);
+                    throw e;
+
+                }
+            }
+            // For other WebSockets or unhandled messages, call the original send
+            return wsInstance._originalSend.apply(this, arguments);
+        };
+        console.log("Patched WebSocket.prototype.send");
+    } else {
+        console.log("WebSocket.prototype.send already patched.");
+    }
+
+
+})();
