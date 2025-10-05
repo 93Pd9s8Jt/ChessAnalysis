@@ -4,7 +4,7 @@
 // @version      2.1
 // @description  Free analysis, so long as you haven't used your actual analysis.
 // @author       You
-// @match        https://www.chess.com/*
+// @match        https://www.chess.com/*/review
 // @grant        GM_getResourceText
 // @grant        GM_getResourceURL
 // @grant        GM_xmlhttpRequest
