@@ -10,6 +10,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @require      https://raw.githubusercontent.com/93Pd9s8Jt/ChessAnalysis/refs/heads/main/chess.min.js?nocache=fsd
+// @license      CC-SA-NC
 // @run-at       document-start
 // ==/UserScript==
 
